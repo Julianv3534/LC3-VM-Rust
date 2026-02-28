@@ -50,6 +50,76 @@ const TRAP_PUTS: u16 = 0x22;
 const TRAP_IN: u16 = 0x23;
 const TRAP_PUTSP: u16 = 0x24;
 const TRAP_HALT: u16 = 0x25;
+
+#[derive(Debug)]
+pub enum VmError {
+    Io(io::Error),
+    ImageTooSmall,
+    ImageTooLarge { origin: u16, words: usize },
+    InvalidOpcode(u16),
+}
+
+impl Display for VmError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VmError::Io(err) => write!(f, "I/O error: {err}"),
+            VmError::ImageTooSmall => write!(f, "image must include at least an origin word"),
+            VmError::ImageTooLarge { origin, words } => {
+                write!(
+                    f,
+                    "image doesn't fit memory (origin=0x{origin:04X}, words={words})"
+                )
+            }
+            VmError::InvalidOpcode(op) => write!(f, "invalid opcode: 0x{op:04X}"),
+        }
+    }
+}
+
+impl Error for VmError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            VmError::Io(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for VmError {
+    fn from(value: io::Error) -> Self {
+        VmError::Io(value)
+    }
+}
+
+pub struct InputBufferingGuard {
+    original: libc::termios,
+}
+
+impl InputBufferingGuard {
+    pub fn disable() -> io::Result<Self> {
+        let fd = libc::STDIN_FILENO;
+        let mut original = unsafe { mem::zeroed::<libc::termios>() };
+        let get_attr = unsafe { libc::tcgetattr(fd, &mut original) };
+        if get_attr < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut raw = original;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        let set_attr = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) };
+        if set_attr < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Self { original })
+    }
+}
+
+impl Drop for InputBufferingGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original) };
+    }
+}
+
 pub struct Vm {
     memory: [u16; MEMORY_MAX],
     reg: [u16; R_COUNT],
@@ -290,3 +360,88 @@ impl Vm {
 
         Ok(())
     }
+
+    fn mem_write(&mut self, address: u16, val: u16) {
+        self.memory[address as usize] = val;
+    }
+
+    fn mem_read(&mut self, address: u16) -> Result<u16, VmError> {
+        if address == MR_KBSR {
+            if check_key()? {
+                self.memory[MR_KBSR as usize] = 1 << 15;
+                self.memory[MR_KBDR as usize] = read_char()?;
+            } else {
+                self.memory[MR_KBSR as usize] = 0;
+            }
+        }
+        Ok(self.memory[address as usize])
+    }
+
+    fn update_flags(&mut self, r: usize) {
+        if self.reg[r] == 0 {
+            self.reg[R_COND] = FL_ZRO;
+        } else if (self.reg[r] >> 15) != 0 {
+            self.reg[R_COND] = FL_NEG;
+        } else {
+            self.reg[R_COND] = FL_POS;
+        }
+    }
+}
+
+fn sign_extend(x: u16, bit_count: u16) -> u16 {
+    if ((x >> (bit_count - 1)) & 1) != 0 {
+        x | (0xFFFFu16 << bit_count)
+    } else {
+        x
+    }
+}
+
+fn check_key() -> io::Result<bool> {
+    let fd = libc::STDIN_FILENO;
+    let mut read_fds = unsafe { mem::zeroed::<libc::fd_set>() };
+    let mut timeout = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+
+    unsafe {
+        libc::FD_ZERO(&mut read_fds);
+        libc::FD_SET(fd, &mut read_fds);
+    }
+
+    let ready = unsafe {
+        libc::select(
+            fd + 1,
+            &mut read_fds,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut timeout,
+        )
+    };
+
+    if ready < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ready > 0)
+    }
+}
+
+fn read_char() -> Result<u16, VmError> {
+    let mut buffer = [0u8; 1];
+    io::stdin().read_exact(&mut buffer)?;
+    Ok(buffer[0] as u16)
+}
+
+fn write_char(ch: u8) -> Result<(), VmError> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(&[ch])?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn write_str(value: &str) -> Result<(), VmError> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(value.as_bytes())?;
+    stdout.flush()?;
+    Ok(())
+}
